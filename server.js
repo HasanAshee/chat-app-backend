@@ -2,12 +2,14 @@ const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const mongoose = require('mongoose');
+const cors = require('cors');
+
 
 
 const dbURI = 'mongodb+srv://atm_user:iyQtDrRv9ROOrgPZ@cluster0.tywrrxs.mongodb.net/chat-db?retryWrites=true&w=majority&appName=Cluster0';
 mongoose.connect(dbURI)
-  .then(() => console.log('MongoDB conectado exitosamente...'))
-  .catch(err => console.error('Error de conexión a MongoDB:', err));
+.then(() => console.log('MongoDB conectado exitosamente...'))
+.catch(err => console.error('Error de conexión a MongoDB:', err));
 
 const Message = mongoose.model('Message', new mongoose.Schema({
   text: String,
@@ -19,17 +21,20 @@ const Message = mongoose.model('Message', new mongoose.Schema({
 
 const app = express();
 const server = http.createServer(app);
+const roomUsers = {};
+
+app.use(cors({
+  origin: ["http://localhost:4200", "https://TU-FUTURO-SITIO.netlify.app"]
+}));
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:4200",
+    origin: ["http://localhost:4200", "https://TU-FUTURO-SITIO.netlify.app"],
     methods: ["GET", "POST"]
   }
 });
-const roomUsers = {};
-
 io.on('connection', (socket) => {
   console.log('Un usuario se ha conectado');
-
+  
   socket.on('join room', async ({ room, username }) => {
     socket.join(room);
     socket.username = username;
@@ -87,7 +92,7 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Servidor escuchando en el puerto ${PORT}`);
 });
