@@ -11,6 +11,8 @@ mongoose.connect(dbURI)
 .then(() => console.log('MongoDB conectado exitosamente...'))
 .catch(err => console.error('Error de conexión a MongoDB:', err));
 
+const frontendURL = "https://chap-appdemo.netlify.app";
+
 const Message = mongoose.model('Message', new mongoose.Schema({
   text: String,
   username: String, 
@@ -23,15 +25,26 @@ const app = express();
 const server = http.createServer(app);
 const roomUsers = {};
 
+//app.use(cors({
+//  origin: ["http://localhost:4200", "https://TU-FUTURO-SITIO.netlify.app"]
+//}));
+
 app.use(cors({
-  origin: ["http://localhost:4200", "https://TU-FUTURO-SITIO.netlify.app"]
+  origin: frontendURL
 }));
+
 const io = new Server(server, {
   cors: {
-    origin: ["http://localhost:4200", "https://TU-FUTURO-SITIO.netlify.app"],
+    origin: frontendURL,
     methods: ["GET", "POST"]
   }
 });
+//const io = new Server(server, {
+//  cors: {
+//    origin: ["http://localhost:4200", "https://TU-FUTURO-SITIO.netlify.app"],
+//    methods: ["GET", "POST"]
+//  }
+//});
 io.on('connection', (socket) => {
   console.log('Un usuario se ha conectado');
   
