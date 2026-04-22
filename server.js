@@ -5,8 +5,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 
 
-
-const dbURI = 'mongodb+srv://atm_user:iyQtDrRv9ROOrgPZ@cluster0.tywrrxs.mongodb.net/chat-db?retryWrites=true&w=majority&appName=Cluster0';
+const dbURI = process.env.MONGODB_URI;
 mongoose.connect(dbURI)
 .then(() => console.log('MongoDB conectado exitosamente...'))
 .catch(err => console.error('Error de conexión a MongoDB:', err));
