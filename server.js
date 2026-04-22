@@ -77,7 +77,7 @@ io.on('connection', (socket) => {
   const msgToSave = new Message(msgObject);
   try {
     await msgToSave.save();
-    socket.broadcast.to(room).emit('chat message', msgObject);
+    io.to(room).emit('chat message', msgObject);
   } catch (err) { 
     console.error('Error al guardar el mensaje:', err);
   }
