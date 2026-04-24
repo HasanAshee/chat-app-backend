@@ -1,9 +1,9 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const mongoose = require('mongoose');
 const cors = require('cors');
-
 
 const dbURI = process.env.MONGODB_URI;
 mongoose.connect(dbURI)
@@ -29,12 +29,24 @@ const roomUsers = {};
 //}));
 
 app.use(cors({
-  origin: frontendURL
+  origin: ["http://localhost:4200", "https://chap-appdemo.netlify.app"]
 }));
+
+app.get('/rooms', (req, res) => {
+  const rooms = Object.entries(roomUsers)
+    .filter(([_, users]) => users.length > 0)
+    .map(([name, users]) => ({
+      name,
+      userCount: users.length
+    }))
+    .sort((a, b) => b.userCount - a.userCount);
+
+  res.json(rooms);
+});
 
 const io = new Server(server, {
   cors: {
-    origin: frontendURL,
+    origin: ["http://localhost:4200", "https://chap-appdemo.netlify.app"],
     methods: ["GET", "POST"]
   }
 });
@@ -44,6 +56,7 @@ const io = new Server(server, {
 //    methods: ["GET", "POST"]
 //  }
 //});
+
 io.on('connection', (socket) => {
   console.log('Un usuario se ha conectado');
   
