@@ -51,10 +51,48 @@ const User = mongoose.model('User', new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 }));
 
+const Conversation = mongoose.model('Conversation', new mongoose.Schema({
+  participants: { type: [String], required: true, index: true },
+  lastMessageAt: { type: Date, default: Date.now },
+  lastMessagePreview: { type: String, default: '' },
+  lastMessageFrom: { type: String, default: '' },
+  unreadCount: {
+    type: Map,
+    of: Number,
+    default: {}
+  }
+}));
+
+const DirectMessage = mongoose.model('DirectMessage', new mongoose.Schema({
+  conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true, index: true },
+  from: { type: String, required: true },
+  fromColor: String,
+  text: String,
+  createdAt: { type: Date, default: Date.now },
+  reactions: {
+    type: Map,
+    of: [String],
+    default: {}
+  },
+  replyTo: { type: mongoose.Schema.Types.ObjectId, ref: 'DirectMessage', default: null },
+  replyToSnapshot: {
+    type: new mongoose.Schema({
+      username: String,
+      nameColor: String,
+      text: String
+    }, { _id: false }),
+    default: null
+  }
+}));
+
 const COLOR_PALETTE = ['#d946ef', '#4ade80', '#f97316', '#3b82f6', '#ec4899', '#14b8a6'];
 
 function generateRandomColor() {
   return COLOR_PALETTE[Math.floor(Math.random() * COLOR_PALETTE.length)];
+}
+
+function sortParticipants(a, b) {
+  return [a, b].sort();
 }
 
 function isValidHexColor(value) {
@@ -259,6 +297,268 @@ app.get('/users/colors', async (req, res) => {
   }
 });
 
+// Lista todas las conversaciones del usuario logueado
+app.get('/dms', authMiddleware, async (req, res) => {
+  try {
+    const conversations = await Conversation
+      .find({ participants: req.username })
+      .sort({ lastMessageAt: -1 })
+      .limit(50);
+
+    // Enriquecer con datos del otro participante (color, etc.)
+    const otherUsernames = conversations.map(c =>
+      c.participants.find(p => p !== req.username)
+    ).filter(Boolean);
+
+    const otherUsers = await User.find({ username: { $in: otherUsernames } })
+      .select('username nameColor');
+    const userMap = new Map(otherUsers.map(u => [u.username, u]));
+
+    const result = conversations.map(c => {
+      const other = c.participants.find(p => p !== req.username);
+      const otherUser = userMap.get(other);
+      return {
+        _id: c._id.toString(),
+        otherUsername: other,
+        otherNameColor: otherUser?.nameColor || '#999999',
+        lastMessageAt: c.lastMessageAt,
+        lastMessagePreview: c.lastMessagePreview,
+        lastMessageFrom: c.lastMessageFrom,
+        unreadCount: c.unreadCount?.get(req.username) || 0
+      };
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error('Error en GET /dms:', err);
+    res.status(500).json({ error: 'Error al cargar DMs' });
+  }
+});
+
+// Abre o crea una conversación con un usuario
+app.post('/dms/open', authMiddleware, async (req, res) => {
+  try {
+    const { withUsername } = req.body;
+    if (!withUsername || typeof withUsername !== 'string') {
+      return res.status(400).json({ error: 'Falta el username' });
+    }
+    if (withUsername === req.username) {
+      return res.status(400).json({ error: 'No podés mandarte un DM a vos mismo' });
+    }
+
+    const otherUser = await User.findOne({ username: withUsername });
+    if (!otherUser) {
+      return res.status(404).json({ error: 'El usuario no existe o no está registrado' });
+    }
+
+    const participants = sortParticipants(req.username, withUsername);
+
+    let conversation = await Conversation.findOne({
+      participants: { $all: participants, $size: 2 }
+    });
+
+    if (!conversation) {
+      conversation = new Conversation({
+        participants,
+        lastMessageAt: new Date(),
+        lastMessagePreview: '',
+        lastMessageFrom: '',
+        unreadCount: new Map()
+      });
+      await conversation.save();
+    }
+
+    res.json({
+      _id: conversation._id.toString(),
+      otherUsername: otherUser.username,
+      otherNameColor: otherUser.nameColor,
+      lastMessageAt: conversation.lastMessageAt,
+      lastMessagePreview: conversation.lastMessagePreview,
+      lastMessageFrom: conversation.lastMessageFrom,
+      unreadCount: conversation.unreadCount?.get(req.username) || 0
+    });
+  } catch (err) {
+    console.error('Error en POST /dms/open:', err);
+    res.status(500).json({ error: 'Error al abrir DM' });
+  }
+});
+
+// Trae mensajes de una conversación (paginado simple, últimos 50)
+app.get('/dms/:id/messages', authMiddleware, async (req, res) => {
+  try {
+    const conversation = await Conversation.findById(req.params.id);
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversación no encontrada' });
+    }
+    if (!conversation.participants.includes(req.username)) {
+      return res.status(403).json({ error: 'No tenés acceso a esta conversación' });
+    }
+
+    const messages = await DirectMessage.find({ conversationId: conversation._id })
+      .sort({ createdAt: -1 })
+      .limit(50);
+
+    const result = messages.reverse().map(m => ({
+      _id: m._id.toString(),
+      from: m.from,
+      fromColor: m.fromColor,
+      text: m.text,
+      createdAt: m.createdAt,
+      reactions: m.reactions ? Object.fromEntries(m.reactions) : {},
+      replyTo: m.replyTo ? m.replyTo.toString() : null,
+      replyToSnapshot: m.replyToSnapshot || null
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error('Error en GET /dms/:id/messages:', err);
+    res.status(500).json({ error: 'Error al cargar mensajes' });
+  }
+});
+
+// ========== DMs ENDPOINT ==========
+app.get('/dms', authMiddleware, async (req, res) => {
+  try {
+    const conversations = await Conversation
+      .find({ participants: req.username })
+      .sort({ lastMessageAt: -1 })
+      .limit(50);
+
+    const otherUsernames = conversations.map(c =>
+      c.participants.find(p => p !== req.username)
+    ).filter(Boolean);
+
+    const otherUsers = await User.find({ username: { $in: otherUsernames } })
+      .select('username nameColor');
+    const userMap = new Map(otherUsers.map(u => [u.username, u]));
+
+    const result = conversations.map(c => {
+      const other = c.participants.find(p => p !== req.username);
+      const otherUser = userMap.get(other);
+      return {
+        _id: c._id.toString(),
+        otherUsername: other,
+        otherNameColor: otherUser?.nameColor || '#999999',
+        lastMessageAt: c.lastMessageAt,
+        lastMessagePreview: c.lastMessagePreview,
+        lastMessageFrom: c.lastMessageFrom,
+        unreadCount: c.unreadCount?.get(req.username) || 0
+      };
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error('Error en GET /dms:', err);
+    res.status(500).json({ error: 'Error al cargar DMs' });
+  }
+});
+
+app.post('/dms/open', authMiddleware, async (req, res) => {
+  try {
+    const { withUsername } = req.body;
+    if (!withUsername || typeof withUsername !== 'string') {
+      return res.status(400).json({ error: 'Falta el username' });
+    }
+    if (withUsername === req.username) {
+      return res.status(400).json({ error: 'No podés mandarte un DM a vos mismo' });
+    }
+
+    const otherUser = await User.findOne({ username: withUsername });
+    if (!otherUser) {
+      return res.status(404).json({ error: 'El usuario no existe o no está registrado' });
+    }
+
+    const participants = sortParticipants(req.username, withUsername);
+
+    let conversation = await Conversation.findOne({
+      participants: { $all: participants, $size: 2 }
+    });
+
+    if (!conversation) {
+      conversation = new Conversation({
+        participants,
+        lastMessageAt: new Date(),
+        lastMessagePreview: '',
+        lastMessageFrom: '',
+        unreadCount: new Map()
+      });
+      await conversation.save();
+    }
+
+    res.json({
+      _id: conversation._id.toString(),
+      otherUsername: otherUser.username,
+      otherNameColor: otherUser.nameColor,
+      lastMessageAt: conversation.lastMessageAt,
+      lastMessagePreview: conversation.lastMessagePreview,
+      lastMessageFrom: conversation.lastMessageFrom,
+      unreadCount: conversation.unreadCount?.get(req.username) || 0
+    });
+  } catch (err) {
+    console.error('Error en POST /dms/open:', err);
+    res.status(500).json({ error: 'Error al abrir DM' });
+  }
+});
+
+app.get('/dms/:id/messages', authMiddleware, async (req, res) => {
+  try {
+    const conversation = await Conversation.findById(req.params.id);
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversación no encontrada' });
+    }
+    if (!conversation.participants.includes(req.username)) {
+      return res.status(403).json({ error: 'No tenés acceso a esta conversación' });
+    }
+
+    const messages = await DirectMessage.find({ conversationId: conversation._id })
+      .sort({ createdAt: -1 })
+      .limit(50);
+
+    const result = messages.reverse().map(m => ({
+      _id: m._id.toString(),
+      from: m.from,
+      fromColor: m.fromColor,
+      text: m.text,
+      createdAt: m.createdAt,
+      reactions: m.reactions ? Object.fromEntries(m.reactions) : {},
+      replyTo: m.replyTo ? m.replyTo.toString() : null,
+      replyToSnapshot: m.replyToSnapshot || null
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error('Error en GET /dms/:id/messages:', err);
+    res.status(500).json({ error: 'Error al cargar mensajes' });
+  }
+});
+
+app.post('/dms/:id/read', authMiddleware, async (req, res) => {
+  try {
+    const conversation = await Conversation.findById(req.params.id);
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversación no encontrada' });
+    }
+    if (!conversation.participants.includes(req.username)) {
+      return res.status(403).json({ error: 'No tenés acceso a esta conversación' });
+    }
+
+    if (!conversation.unreadCount) conversation.unreadCount = new Map();
+    conversation.unreadCount.set(req.username, 0);
+    await conversation.save();
+
+    const otherUser = conversation.participants.find(p => p !== req.username);
+    io.to(`user:${otherUser}`).emit('dm read', {
+      conversationId: conversation._id.toString(),
+      readBy: req.username
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en POST /dms/:id/read:', err);
+    res.status(500).json({ error: 'Error al marcar como leído' });
+  }
+});
+
 // ========== ROOMS ENDPOINT ==========
 app.get('/rooms', (req, res) => {
   const rooms = Object.entries(roomUsers)
@@ -415,6 +715,123 @@ io.on('connection', (socket) => {
       console.error('Error en join room:', err);
       socket.emit('join error', { message: 'Error interno al unirse a la sala' });
     }
+  });
+
+  socket.on('register user channel', async ({ token }) => {
+    if (!token) return;
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const user = await User.findById(payload.userId);
+      if (!user) return;
+      socket.authUsername = user.username;
+      socket.join(`user:${user.username}`);
+    } catch (err) {
+    }
+  });
+
+  socket.on('dm send', async ({ conversationId, text, replyToId, token }) => {
+    try {
+      if (!token) return;
+      const payload = jwt.verify(token, JWT_SECRET);
+      const sender = await User.findById(payload.userId);
+      if (!sender) return;
+
+      const conversation = await Conversation.findById(conversationId);
+      if (!conversation) return;
+      if (!conversation.participants.includes(sender.username)) return;
+
+      const otherUser = conversation.participants.find(p => p !== sender.username);
+
+      let replyToSnapshot = null;
+      let replyToRef = null;
+      if (replyToId) {
+        try {
+          const original = await DirectMessage.findById(replyToId);
+          if (original && original.conversationId.toString() === conversationId) {
+            replyToRef = original._id;
+            replyToSnapshot = {
+              username: original.from,
+              nameColor: original.fromColor || '#999999',
+              text: (original.text || '').slice(0, 200)
+            };
+          }
+        } catch (err) {
+        }
+      }
+
+      const dm = new DirectMessage({
+        conversationId: conversation._id,
+        from: sender.username,
+        fromColor: sender.nameColor,
+        text,
+        replyTo: replyToRef,
+        replyToSnapshot
+      });
+      await dm.save();
+
+      conversation.lastMessageAt = dm.createdAt;
+      conversation.lastMessagePreview = (text || '').slice(0, 80);
+      conversation.lastMessageFrom = sender.username;
+      if (!conversation.unreadCount) conversation.unreadCount = new Map();
+      const currentUnread = conversation.unreadCount.get(otherUser) || 0;
+      conversation.unreadCount.set(otherUser, currentUnread + 1);
+      await conversation.save();
+
+      const payloadOut = {
+        _id: dm._id.toString(),
+        conversationId: conversation._id.toString(),
+        from: dm.from,
+        fromColor: dm.fromColor,
+        text: dm.text,
+        createdAt: dm.createdAt,
+        reactions: {},
+        replyTo: dm.replyTo ? dm.replyTo.toString() : null,
+        replyToSnapshot: dm.replyToSnapshot || null,
+        conversationMeta: {
+          lastMessageAt: conversation.lastMessageAt,
+          lastMessagePreview: conversation.lastMessagePreview,
+          lastMessageFrom: conversation.lastMessageFrom
+        }
+      };
+
+      io.to(`user:${sender.username}`).emit('dm message', payloadOut);
+      io.to(`user:${otherUser}`).emit('dm message', payloadOut);
+    } catch (err) {
+      console.error('Error en dm send:', err);
+    }
+  });
+
+  socket.on('dm typing', ({ conversationId, token }) => {
+    if (!token) return;
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      if (!socket.authUsername) return;
+      Conversation.findById(conversationId).then(conv => {
+        if (!conv) return;
+        const other = conv.participants.find(p => p !== socket.authUsername);
+        if (other) {
+          io.to(`user:${other}`).emit('dm typing', {
+            conversationId,
+            from: socket.authUsername
+          });
+        }
+      });
+    } catch (err) {}
+  });
+
+  socket.on('dm stop typing', ({ conversationId, token }) => {
+    if (!token) return;
+    try {
+      jwt.verify(token, JWT_SECRET);
+      if (!socket.authUsername) return;
+      Conversation.findById(conversationId).then(conv => {
+        if (!conv) return;
+        const other = conv.participants.find(p => p !== socket.authUsername);
+        if (other) {
+          io.to(`user:${other}`).emit('dm stop typing', { conversationId });
+        }
+      });
+    } catch (err) {}
   });
 
   socket.on('chat message', async ({ room, message, username, replyToId }) => {
