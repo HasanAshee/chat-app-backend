@@ -15,8 +15,8 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
-mongoose.connect(dbURI)
-.then(() => console.log('MongoDB conectado exitosamente...'))
+mongoose.connect(dbURI, { dbName: 'chat-db' })
+.then(() => console.log('MongoDB conectado exitosamente a chat-db'))
 .catch(err => console.error('Error de conexión a MongoDB:', err));
 
 const frontendURL = "https://chap-appdemo.netlify.app";
@@ -24,6 +24,7 @@ const frontendURL = "https://chap-appdemo.netlify.app";
 const Message = mongoose.model('Message', new mongoose.Schema({
   text: String,
   username: String,
+  nameColor: String,
   type: String,
   room: String,
   createdAt: { type: Date, default: Date.now },
@@ -51,8 +52,18 @@ function isValidHexColor(value) {
   return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value);
 }
 
+function getGuestColor(username) {
+  let hash = 0;
+  for (let i = 0; i < username.length; i++) {
+    hash = username.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const index = Math.abs(hash % COLOR_PALETTE.length);
+  return COLOR_PALETTE[index];
+}
+
 const app = express();
 const server = http.createServer(app);
+
 const roomUsers = {};
 
 app.use(cors({
@@ -210,6 +221,35 @@ app.patch('/users/me', authMiddleware, async (req, res) => {
   }
 });
 
+app.get('/users/colors', async (req, res) => {
+  try {
+    const usernamesParam = req.query.usernames;
+    if (!usernamesParam || typeof usernamesParam !== 'string') {
+      return res.json({});
+    }
+
+    const usernames = usernamesParam
+      .split(',')
+      .map(u => u.trim())
+      .filter(u => u.length > 0)
+      .slice(0, 100);
+
+    if (usernames.length === 0) {
+      return res.json({});
+    }
+
+    const users = await User.find({ username: { $in: usernames } }).select('username nameColor');
+    const colorMap = {};
+    for (const u of users) {
+      colorMap[u.username] = u.nameColor;
+    }
+    res.json(colorMap);
+  } catch (err) {
+    console.error('Error en /users/colors:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
 // ========== ROOMS ENDPOINT ==========
 app.get('/rooms', (req, res) => {
   const rooms = Object.entries(roomUsers)
@@ -234,48 +274,119 @@ const io = new Server(server, {
 io.on('connection', (socket) => {
   console.log('Un usuario se ha conectado');
 
-  socket.on('join room', async ({ room, username }) => {
-    socket.join(room);
-    socket.username = username;
-    socket.room = room;
-
-    if (!roomUsers[room]) {
-      roomUsers[room] = [];
-    }
-    roomUsers[room].push(username);
-
+  socket.on('join room', async ({ room, username, token }) => {
     try {
-      const messages = await Message.find({ room: room }).sort({ createdAt: -1 }).limit(50);
-      const messagesWithReactions = messages.reverse().map(msg => ({
-        _id: msg._id,
-        text: msg.text,
-        username: msg.username,
-        type: msg.type,
-        room: msg.room,
-        createdAt: msg.createdAt,
-        reactions: msg.reactions ? Object.fromEntries(msg.reactions) : {}
-      }));
-      socket.emit('history', messagesWithReactions);
-    } catch (err) { /* ... */ }
+      let resolvedUsername = username;
+      let nameColor;
+      let isGuest = true;
 
-    io.to(room).emit('update user list', roomUsers[room]);
+      if (token) {
+        try {
+          const payload = jwt.verify(token, JWT_SECRET);
+          const user = await User.findById(payload.userId);
+          if (!user) {
+            socket.emit('join error', { message: 'Usuario no encontrado' });
+            return;
+          }
+          resolvedUsername = user.username;
+          nameColor = user.nameColor;
+          isGuest = false;
+        } catch (err) {
+          socket.emit('join error', { message: 'Sesión inválida o expirada. Volvé a iniciar sesión.' });
+          return;
+        }
+      } else {
+        if (!username || typeof username !== 'string' || !username.trim()) {
+          socket.emit('join error', { message: 'Username inválido' });
+          return;
+        }
+        const existing = await User.findOne({ username: username.trim() });
+        if (existing) {
+          socket.emit('join error', {
+            message: 'Ese nombre pertenece a un usuario registrado. Iniciá sesión o usá otro nombre.'
+          });
+          return;
+        }
+        resolvedUsername = username.trim();
+        nameColor = getGuestColor(resolvedUsername);
+        isGuest = true;
+      }
 
-    const joinMessage = {
-      text: `¡${username} se ha unido al chat!`,
-      type: 'notification'
-    };
-    socket.broadcast.to(room).emit('chat message', joinMessage);
+      if (!room || typeof room !== 'string' || !room.trim()) {
+        socket.emit('join error', { message: 'Nombre de sala inválido' });
+        return;
+      }
+
+      if (roomUsers[room] && roomUsers[room].some(u => u.username === resolvedUsername)) {
+        socket.emit('join error', { message: 'Ya hay alguien con ese nombre en la sala' });
+        return;
+      }
+
+      socket.join(room);
+      socket.username = resolvedUsername;
+      socket.room = room;
+      socket.isGuest = isGuest;
+      socket.nameColor = nameColor;
+
+      if (!roomUsers[room]) {
+        roomUsers[room] = [];
+      }
+      roomUsers[room].push({ username: resolvedUsername, nameColor, isGuest });
+
+      socket.emit('join success', {
+        username: resolvedUsername,
+        nameColor,
+        isGuest,
+        room
+      });
+
+      try {
+        const messages = await Message.find({ room: room }).sort({ createdAt: -1 }).limit(50);
+        const messagesWithReactions = messages.reverse().map(msg => ({
+          _id: msg._id,
+          text: msg.text,
+          username: msg.username,
+          nameColor: msg.nameColor,
+          type: msg.type,
+          room: msg.room,
+          createdAt: msg.createdAt,
+          reactions: msg.reactions ? Object.fromEntries(msg.reactions) : {}
+        }));
+        socket.emit('history', messagesWithReactions);
+      } catch (err) {
+        console.error('Error al cargar historial:', err);
+      }
+
+      io.to(room).emit('update user list', roomUsers[room]);
+
+      const joinMessage = {
+        text: `¡${resolvedUsername} se ha unido al chat!`,
+        type: 'notification'
+      };
+      socket.broadcast.to(room).emit('chat message', joinMessage);
+    } catch (err) {
+      console.error('Error en join room:', err);
+      socket.emit('join error', { message: 'Error interno al unirse a la sala' });
+    }
   });
 
   socket.on('chat message', async ({ room, message, username }) => {
     try {
-      const msgToSave = new Message({ text: message, username, type: 'message', room });
+      const senderColor = socket.nameColor || getGuestColor(username);
+      const msgToSave = new Message({
+        text: message,
+        username,
+        nameColor: senderColor,
+        type: 'message',
+        room
+      });
       await msgToSave.save();
 
       io.to(room).emit('chat message', {
         _id: msgToSave._id.toString(),
         text: msgToSave.text,
         username: msgToSave.username,
+        nameColor: msgToSave.nameColor,
         type: msgToSave.type,
         room: msgToSave.room,
         createdAt: msgToSave.createdAt,
@@ -322,11 +433,32 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('color changed', ({ nameColor }) => {
+    if (!socket.username || !socket.room || socket.isGuest) return;
+    if (!isValidHexColor(nameColor)) return;
+
+    socket.nameColor = nameColor;
+
+    if (roomUsers[socket.room]) {
+      const userEntry = roomUsers[socket.room].find(u => u.username === socket.username);
+      if (userEntry) {
+        userEntry.nameColor = nameColor;
+      }
+    }
+
+    io.to(socket.room).emit('user color updated', {
+      username: socket.username,
+      nameColor
+    });
+
+    io.to(socket.room).emit('update user list', roomUsers[socket.room]);
+  });
+
   socket.on('disconnect', () => {
     console.log('Un usuario se ha desconectado');
     const { username, room } = socket;
     if (username && room && roomUsers[room]) {
-      roomUsers[room] = roomUsers[room].filter(user => user !== username);
+      roomUsers[room] = roomUsers[room].filter(u => u.username !== username);
       io.to(room).emit('update user list', roomUsers[room]);
 
       const leaveMessage = {
