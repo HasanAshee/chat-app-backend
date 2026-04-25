@@ -32,6 +32,15 @@ const Message = mongoose.model('Message', new mongoose.Schema({
     type: Map,
     of: [String],
     default: {}
+  },
+  replyTo: { type: mongoose.Schema.Types.ObjectId, ref: 'Message', default: null },
+  replyToSnapshot: {
+    type: new mongoose.Schema({
+      username: String,
+      nameColor: String,
+      text: String
+    }, { _id: false }),
+    default: null
   }
 }));
 
@@ -350,7 +359,9 @@ io.on('connection', (socket) => {
           type: msg.type,
           room: msg.room,
           createdAt: msg.createdAt,
-          reactions: msg.reactions ? Object.fromEntries(msg.reactions) : {}
+          reactions: msg.reactions ? Object.fromEntries(msg.reactions) : {},
+          replyTo: msg.replyTo ? msg.replyTo.toString() : null,
+          replyToSnapshot: msg.replyToSnapshot || null
         }));
         socket.emit('history', messagesWithReactions);
       } catch (err) {
@@ -370,15 +381,37 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('chat message', async ({ room, message, username }) => {
+  socket.on('chat message', async ({ room, message, username, replyToId }) => {
     try {
       const senderColor = socket.nameColor || getGuestColor(username);
+
+      let replyToSnapshot = null;
+      let replyToRef = null;
+
+      if (replyToId) {
+        try {
+          const original = await Message.findById(replyToId);
+          if (original && original.room === room && original.type === 'message') {
+            replyToRef = original._id;
+            replyToSnapshot = {
+              username: original.username,
+              nameColor: original.nameColor || getGuestColor(original.username),
+              text: (original.text || '').slice(0, 200)
+            };
+          }
+        } catch (err) {
+          console.warn('replyToId inválido, se ignora:', err.message);
+        }
+      }
+
       const msgToSave = new Message({
         text: message,
         username,
         nameColor: senderColor,
         type: 'message',
-        room
+        room,
+        replyTo: replyToRef,
+        replyToSnapshot
       });
       await msgToSave.save();
 
@@ -390,7 +423,9 @@ io.on('connection', (socket) => {
         type: msgToSave.type,
         room: msgToSave.room,
         createdAt: msgToSave.createdAt,
-        reactions: {}
+        reactions: {},
+        replyTo: msgToSave.replyTo ? msgToSave.replyTo.toString() : null,
+        replyToSnapshot: msgToSave.replyToSnapshot || null
       });
     } catch (err) {
       console.error('Error al guardar el mensaje:', err);
