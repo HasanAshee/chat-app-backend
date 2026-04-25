@@ -272,6 +272,42 @@ app.get('/rooms', (req, res) => {
   res.json(rooms);
 });
 
+app.get('/messages/search', async (req, res) => {
+  try {
+    const { room, q } = req.query;
+
+    if (!room || typeof room !== 'string') {
+      return res.status(400).json({ error: 'Parámetro "room" requerido' });
+    }
+    if (!q || typeof q !== 'string' || q.trim().length < 2) {
+      return res.json([]);
+    }
+
+    const escaped = q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escaped, 'i');
+
+    const results = await Message.find({
+      room,
+      type: 'message',
+      text: regex
+    })
+      .sort({ createdAt: -1 })
+      .limit(30)
+      .select('_id text username nameColor createdAt');
+
+    res.json(results.map(msg => ({
+      _id: msg._id.toString(),
+      text: msg.text,
+      username: msg.username,
+      nameColor: msg.nameColor || '#999999',
+      createdAt: msg.createdAt
+    })));
+  } catch (err) {
+    console.error('Error en /messages/search:', err);
+    res.status(500).json({ error: 'Error al buscar mensajes' });
+  }
+});
+
 // ========== SOCKETS ==========
 const io = new Server(server, {
   cors: {
