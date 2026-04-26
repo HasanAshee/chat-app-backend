@@ -51,6 +51,15 @@ const User = mongoose.model('User', new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 }));
 
+const Room = mongoose.model('Room', new mongoose.Schema({
+  name: { type: String, required: true, unique: true, trim: true },
+  visibility: { type: String, enum: ['public', 'password', 'invite'], required: true },
+  passwordHash: { type: String, default: null },
+  ownerUsername: { type: String, required: true },
+  invitedUsernames: { type: [String], default: [] },
+  createdAt: { type: Date, default: Date.now }
+}));
+
 const Conversation = mongoose.model('Conversation', new mongoose.Schema({
   participants: { type: [String], required: true, index: true },
   lastMessageAt: { type: Date, default: Date.now },
@@ -89,6 +98,13 @@ const COLOR_PALETTE = ['#d946ef', '#4ade80', '#f97316', '#3b82f6', '#ec4899', '#
 
 function generateRandomColor() {
   return COLOR_PALETTE[Math.floor(Math.random() * COLOR_PALETTE.length)];
+}
+
+function isValidRoomName(name) {
+  if (typeof name !== 'string') return false;
+  const trimmed = name.trim();
+  if (trimmed.length < 2 || trimmed.length > 32) return false;
+  return /^[\w-]+$/.test(trimmed);
 }
 
 function sortParticipants(a, b) {
@@ -297,7 +313,267 @@ app.get('/users/colors', async (req, res) => {
   }
 });
 
-// Lista todas las conversaciones del usuario logueado
+app.post('/rooms', authMiddleware, async (req, res) => {
+  try {
+    const { name, visibility, password, invitedUsernames } = req.body;
+
+    if (!isValidRoomName(name)) {
+      return res.status(400).json({
+        error: 'Nombre de sala inválido. 2-32 caracteres, solo letras, números, _ y -'
+      });
+    }
+    if (!['public', 'password', 'invite'].includes(visibility)) {
+      return res.status(400).json({ error: 'Visibilidad inválida' });
+    }
+    if (visibility === 'password' && (!password || password.length < 4)) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 4 caracteres' });
+    }
+
+    const trimmedName = name.trim();
+
+    const existing = await Room.findOne({ name: trimmedName });
+    if (existing) {
+      return res.status(409).json({ error: 'Ya existe una sala con ese nombre' });
+    }
+
+    let passwordHash = null;
+    if (visibility === 'password') {
+      passwordHash = await bcrypt.hash(password, 10);
+    }
+
+    let invitedList = [];
+    if (visibility === 'invite' && Array.isArray(invitedUsernames)) {
+      const cleanList = invitedUsernames
+        .map(u => typeof u === 'string' ? u.trim() : '')
+        .filter(u => u.length > 0)
+        .filter(u => u !== req.username)
+        .slice(0, 50);
+
+      if (cleanList.length > 0) {
+        const users = await User.find({ username: { $in: cleanList } }).select('username');
+        invitedList = users.map(u => u.username);
+      }
+    }
+
+    const room = new Room({
+      name: trimmedName,
+      visibility,
+      passwordHash,
+      ownerUsername: req.username,
+      invitedUsernames: invitedList
+    });
+    await room.save();
+
+    res.status(201).json({
+      _id: room._id.toString(),
+      name: room.name,
+      visibility: room.visibility,
+      ownerUsername: room.ownerUsername,
+      invitedUsernames: room.invitedUsernames,
+      createdAt: room.createdAt
+    });
+  } catch (err) {
+    console.error('Error en POST /rooms:', err);
+    res.status(500).json({ error: 'Error al crear la sala' });
+  }
+});
+
+app.get('/rooms/mine', authMiddleware, async (req, res) => {
+  try {
+    const rooms = await Room.find({
+      $or: [
+        { ownerUsername: req.username },
+        { invitedUsernames: req.username }
+      ]
+    }).sort({ createdAt: -1 });
+
+    res.json(rooms.map(r => ({
+      _id: r._id.toString(),
+      name: r.name,
+      visibility: r.visibility,
+      ownerUsername: r.ownerUsername,
+      invitedUsernames: r.invitedUsernames,
+      isOwner: r.ownerUsername === req.username,
+      createdAt: r.createdAt
+    })));
+  } catch (err) {
+    console.error('Error en GET /rooms/mine:', err);
+    res.status(500).json({ error: 'Error al cargar salas' });
+  }
+});
+
+app.get('/rooms/:name', authMiddleware, async (req, res) => {
+  try {
+    const room = await Room.findOne({ name: req.params.name });
+    if (!room) {
+      return res.status(404).json({ error: 'Sala no encontrada' });
+    }
+
+    const isOwner = room.ownerUsername === req.username;
+    const isInvited = room.invitedUsernames.includes(req.username);
+
+    if (!isOwner && !isInvited && room.visibility === 'invite') {
+      return res.status(403).json({ error: 'No tenés acceso a esta sala' });
+    }
+
+    const response = {
+      _id: room._id.toString(),
+      name: room.name,
+      visibility: room.visibility,
+      ownerUsername: room.ownerUsername,
+      isOwner,
+      createdAt: room.createdAt
+    };
+
+    if (isOwner) {
+      response.invitedUsernames = room.invitedUsernames;
+    }
+
+    res.json(response);
+  } catch (err) {
+    console.error('Error en GET /rooms/:name:', err);
+    res.status(500).json({ error: 'Error al cargar la sala' });
+  }
+});
+
+app.patch('/rooms/:name', authMiddleware, async (req, res) => {
+  try {
+    const room = await Room.findOne({ name: req.params.name });
+    if (!room) return res.status(404).json({ error: 'Sala no encontrada' });
+    if (room.ownerUsername !== req.username) {
+      return res.status(403).json({ error: 'Solo el dueño puede editar la sala' });
+    }
+
+    const { visibility, password } = req.body;
+    const update = {};
+
+    if (visibility !== undefined) {
+      if (!['public', 'password', 'invite'].includes(visibility)) {
+        return res.status(400).json({ error: 'Visibilidad inválida' });
+      }
+      update.visibility = visibility;
+      if (visibility !== 'password') {
+        update.passwordHash = null;
+      }
+    }
+
+    if (password !== undefined) {
+      if (typeof password !== 'string' || password.length < 4) {
+        return res.status(400).json({ error: 'La contraseña debe tener al menos 4 caracteres' });
+      }
+      update.passwordHash = await bcrypt.hash(password, 10);
+      update.visibility = 'password';
+    }
+
+    const updated = await Room.findByIdAndUpdate(room._id, update, { new: true });
+    res.json({
+      _id: updated._id.toString(),
+      name: updated.name,
+      visibility: updated.visibility,
+      ownerUsername: updated.ownerUsername,
+      invitedUsernames: updated.invitedUsernames,
+      isOwner: true
+    });
+  } catch (err) {
+    console.error('Error en PATCH /rooms/:name:', err);
+    res.status(500).json({ error: 'Error al actualizar la sala' });
+  }
+});
+
+app.post('/rooms/:name/invite', authMiddleware, async (req, res) => {
+  try {
+    const room = await Room.findOne({ name: req.params.name });
+    if (!room) return res.status(404).json({ error: 'Sala no encontrada' });
+    if (room.ownerUsername !== req.username) {
+      return res.status(403).json({ error: 'Solo el dueño puede invitar' });
+    }
+
+    const { username } = req.body;
+    if (!username || typeof username !== 'string') {
+      return res.status(400).json({ error: 'Falta el username' });
+    }
+    if (username === req.username) {
+      return res.status(400).json({ error: 'No te podés invitar a vos mismo' });
+    }
+
+    const userToInvite = await User.findOne({ username });
+    if (!userToInvite) {
+      return res.status(404).json({ error: 'El usuario no existe o no está registrado' });
+    }
+
+    if (room.invitedUsernames.includes(username)) {
+      return res.status(409).json({ error: 'Ese usuario ya está invitado' });
+    }
+
+    room.invitedUsernames.push(username);
+    await room.save();
+
+    res.json({
+      invitedUsernames: room.invitedUsernames
+    });
+  } catch (err) {
+    console.error('Error en POST /rooms/:name/invite:', err);
+    res.status(500).json({ error: 'Error al invitar' });
+  }
+});
+
+app.post('/rooms/:name/uninvite', authMiddleware, async (req, res) => {
+  try {
+    const room = await Room.findOne({ name: req.params.name });
+    if (!room) return res.status(404).json({ error: 'Sala no encontrada' });
+    if (room.ownerUsername !== req.username) {
+      return res.status(403).json({ error: 'Solo el dueño puede desinvitar' });
+    }
+
+    const { username } = req.body;
+    if (!username || typeof username !== 'string') {
+      return res.status(400).json({ error: 'Falta el username' });
+    }
+
+    room.invitedUsernames = room.invitedUsernames.filter(u => u !== username);
+    await room.save();
+
+    const socketsInRoom = await io.in(room.name).fetchSockets();
+    for (const s of socketsInRoom) {
+      if (s.username === username && !s.isGuest) {
+        s.leave(room.name);
+        s.emit('kicked from room', { room: room.name, reason: 'Fuiste desinvitado de la sala' });
+      }
+    }
+
+    res.json({
+      invitedUsernames: room.invitedUsernames
+    });
+  } catch (err) {
+    console.error('Error en POST /rooms/:name/uninvite:', err);
+    res.status(500).json({ error: 'Error al desinvitar' });
+  }
+});
+
+app.delete('/rooms/:name', authMiddleware, async (req, res) => {
+  try {
+    const room = await Room.findOne({ name: req.params.name });
+    if (!room) return res.status(404).json({ error: 'Sala no encontrada' });
+    if (room.ownerUsername !== req.username) {
+      return res.status(403).json({ error: 'Solo el dueño puede borrar la sala' });
+    }
+
+    await Room.findByIdAndDelete(room._id);
+
+    io.to(room.name).emit('room deleted', { room: room.name });
+
+    const socketsInRoom = await io.in(room.name).fetchSockets();
+    for (const s of socketsInRoom) {
+      s.leave(room.name);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en DELETE /rooms/:name:', err);
+    res.status(500).json({ error: 'Error al borrar la sala' });
+  }
+});
+
 app.get('/dms', authMiddleware, async (req, res) => {
   try {
     const conversations = await Conversation
@@ -335,7 +611,6 @@ app.get('/dms', authMiddleware, async (req, res) => {
   }
 });
 
-// Abre o crea una conversación con un usuario
 app.post('/dms/open', authMiddleware, async (req, res) => {
   try {
     const { withUsername } = req.body;
@@ -383,7 +658,6 @@ app.post('/dms/open', authMiddleware, async (req, res) => {
   }
 });
 
-// Trae mensajes de una conversación (paginado simple, últimos 50)
 app.get('/dms/:id/messages', authMiddleware, async (req, res) => {
   try {
     const conversation = await Conversation.findById(req.params.id);
@@ -560,16 +834,39 @@ app.post('/dms/:id/read', authMiddleware, async (req, res) => {
 });
 
 // ========== ROOMS ENDPOINT ==========
-app.get('/rooms', (req, res) => {
-  const rooms = Object.entries(roomUsers)
-    .filter(([_, users]) => users.length > 0)
-    .map(([name, users]) => ({
-      name,
-      userCount: users.length
-    }))
-    .sort((a, b) => b.userCount - a.userCount);
+app.get('/rooms', async (req, res) => {
+  try {
+    const activeRoomNames = Object.entries(roomUsers)
+      .filter(([_, users]) => users.length > 0)
+      .map(([name]) => name);
 
-  res.json(rooms);
+    if (activeRoomNames.length === 0) {
+      return res.json([]);
+    }
+
+    const registered = await Room.find({ name: { $in: activeRoomNames } });
+    const registeredMap = new Map(registered.map(r => [r.name, r]));
+
+    const rooms = activeRoomNames
+      .map(name => {
+        const reg = registeredMap.get(name);
+        if (reg && reg.visibility === 'invite') return null;
+
+        return {
+          name,
+          userCount: roomUsers[name].length,
+          visibility: reg ? reg.visibility : 'public',
+          requiresPassword: reg ? reg.visibility === 'password' : false
+        };
+      })
+      .filter(r => r !== null)
+      .sort((a, b) => b.userCount - a.userCount);
+
+    res.json(rooms);
+  } catch (err) {
+    console.error('Error en GET /rooms:', err);
+    res.status(500).json({ error: 'Error al cargar salas' });
+  }
 });
 
 app.get('/messages/search', async (req, res) => {
@@ -617,9 +914,31 @@ const io = new Server(server, {
 });
 
 io.on('connection', (socket) => {
-  console.log('Un usuario se ha conectado');
+  console.log('Un usuario se ha conectado, socket:', socket.id);
 
-  socket.on('join room', async ({ room, username, token }) => {
+  // ============ REGISTER USER CHANNEL ============
+  socket.on('register user channel', async ({ token }) => {
+    if (!token) {
+      console.log('[register user channel] sin token');
+      return;
+    }
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const user = await User.findById(payload.userId);
+      if (!user) {
+        console.log('[register user channel] user no encontrado');
+        return;
+      }
+      socket.authUsername = user.username;
+      socket.join(`user:${user.username}`);
+      console.log(`[register user channel] OK: ${user.username} (socket ${socket.id})`);
+    } catch (err) {
+      console.log('[register user channel] error:', err.message);
+    }
+  });
+
+  // ============ JOIN ROOM ============
+  socket.on('join room', async ({ room, username, token, password }) => {
     try {
       let resolvedUsername = username;
       let nameColor;
@@ -662,31 +981,73 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (roomUsers[room] && roomUsers[room].some(u => u.username === resolvedUsername)) {
+      const trimmedRoom = room.trim();
+
+      const roomDoc = await Room.findOne({ name: trimmedRoom });
+
+      if (roomDoc) {
+        if (roomDoc.visibility === 'invite') {
+          if (isGuest) {
+            socket.emit('join error', {
+              message: 'Esta sala es solo para usuarios registrados invitados. Iniciá sesión.'
+            });
+            return;
+          }
+          const isOwner = roomDoc.ownerUsername === resolvedUsername;
+          const isInvited = roomDoc.invitedUsernames.includes(resolvedUsername);
+          if (!isOwner && !isInvited) {
+            socket.emit('join error', {
+              message: 'No tenés acceso a esta sala. Pedile al dueño que te invite.'
+            });
+            return;
+          }
+        } else if (roomDoc.visibility === 'password') {
+          if (!password || typeof password !== 'string') {
+            socket.emit('join password required', { room: trimmedRoom });
+            return;
+          }
+          const valid = await bcrypt.compare(password, roomDoc.passwordHash || '');
+          if (!valid) {
+            socket.emit('join error', { message: 'Contraseña incorrecta' });
+            return;
+          }
+        }
+      }
+
+      if (roomUsers[trimmedRoom] && roomUsers[trimmedRoom].some(u => u.username === resolvedUsername)) {
         socket.emit('join error', { message: 'Ya hay alguien con ese nombre en la sala' });
         return;
       }
 
-      socket.join(room);
+      socket.join(trimmedRoom);
       socket.username = resolvedUsername;
-      socket.room = room;
+      socket.room = trimmedRoom;
       socket.isGuest = isGuest;
       socket.nameColor = nameColor;
 
-      if (!roomUsers[room]) {
-        roomUsers[room] = [];
+      if (!roomUsers[trimmedRoom]) {
+        roomUsers[trimmedRoom] = [];
       }
-      roomUsers[room].push({ username: resolvedUsername, nameColor, isGuest });
+      roomUsers[trimmedRoom].push({ username: resolvedUsername, nameColor, isGuest });
 
       socket.emit('join success', {
         username: resolvedUsername,
         nameColor,
         isGuest,
-        room
+        room: trimmedRoom,
+        roomMeta: roomDoc ? {
+          visibility: roomDoc.visibility,
+          ownerUsername: roomDoc.ownerUsername,
+          isOwner: roomDoc.ownerUsername === resolvedUsername
+        } : {
+          visibility: 'public',
+          ownerUsername: null,
+          isOwner: false
+        }
       });
 
       try {
-        const messages = await Message.find({ room: room }).sort({ createdAt: -1 }).limit(50);
+        const messages = await Message.find({ room: trimmedRoom }).sort({ createdAt: -1 }).limit(50);
         const messagesWithReactions = messages.reverse().map(msg => ({
           _id: msg._id,
           text: msg.text,
@@ -704,136 +1065,20 @@ io.on('connection', (socket) => {
         console.error('Error al cargar historial:', err);
       }
 
-      io.to(room).emit('update user list', roomUsers[room]);
+      io.to(trimmedRoom).emit('update user list', roomUsers[trimmedRoom]);
 
       const joinMessage = {
         text: `¡${resolvedUsername} se ha unido al chat!`,
         type: 'notification'
       };
-      socket.broadcast.to(room).emit('chat message', joinMessage);
+      socket.broadcast.to(trimmedRoom).emit('chat message', joinMessage);
     } catch (err) {
       console.error('Error en join room:', err);
       socket.emit('join error', { message: 'Error interno al unirse a la sala' });
     }
   });
 
-  socket.on('register user channel', async ({ token }) => {
-    if (!token) return;
-    try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      const user = await User.findById(payload.userId);
-      if (!user) return;
-      socket.authUsername = user.username;
-      socket.join(`user:${user.username}`);
-    } catch (err) {
-    }
-  });
-
-  socket.on('dm send', async ({ conversationId, text, replyToId, token }) => {
-    try {
-      if (!token) return;
-      const payload = jwt.verify(token, JWT_SECRET);
-      const sender = await User.findById(payload.userId);
-      if (!sender) return;
-
-      const conversation = await Conversation.findById(conversationId);
-      if (!conversation) return;
-      if (!conversation.participants.includes(sender.username)) return;
-
-      const otherUser = conversation.participants.find(p => p !== sender.username);
-
-      let replyToSnapshot = null;
-      let replyToRef = null;
-      if (replyToId) {
-        try {
-          const original = await DirectMessage.findById(replyToId);
-          if (original && original.conversationId.toString() === conversationId) {
-            replyToRef = original._id;
-            replyToSnapshot = {
-              username: original.from,
-              nameColor: original.fromColor || '#999999',
-              text: (original.text || '').slice(0, 200)
-            };
-          }
-        } catch (err) {
-        }
-      }
-
-      const dm = new DirectMessage({
-        conversationId: conversation._id,
-        from: sender.username,
-        fromColor: sender.nameColor,
-        text,
-        replyTo: replyToRef,
-        replyToSnapshot
-      });
-      await dm.save();
-
-      conversation.lastMessageAt = dm.createdAt;
-      conversation.lastMessagePreview = (text || '').slice(0, 80);
-      conversation.lastMessageFrom = sender.username;
-      if (!conversation.unreadCount) conversation.unreadCount = new Map();
-      const currentUnread = conversation.unreadCount.get(otherUser) || 0;
-      conversation.unreadCount.set(otherUser, currentUnread + 1);
-      await conversation.save();
-
-      const payloadOut = {
-        _id: dm._id.toString(),
-        conversationId: conversation._id.toString(),
-        from: dm.from,
-        fromColor: dm.fromColor,
-        text: dm.text,
-        createdAt: dm.createdAt,
-        reactions: {},
-        replyTo: dm.replyTo ? dm.replyTo.toString() : null,
-        replyToSnapshot: dm.replyToSnapshot || null,
-        conversationMeta: {
-          lastMessageAt: conversation.lastMessageAt,
-          lastMessagePreview: conversation.lastMessagePreview,
-          lastMessageFrom: conversation.lastMessageFrom
-        }
-      };
-
-      io.to(`user:${sender.username}`).emit('dm message', payloadOut);
-      io.to(`user:${otherUser}`).emit('dm message', payloadOut);
-    } catch (err) {
-      console.error('Error en dm send:', err);
-    }
-  });
-
-  socket.on('dm typing', ({ conversationId, token }) => {
-    if (!token) return;
-    try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      if (!socket.authUsername) return;
-      Conversation.findById(conversationId).then(conv => {
-        if (!conv) return;
-        const other = conv.participants.find(p => p !== socket.authUsername);
-        if (other) {
-          io.to(`user:${other}`).emit('dm typing', {
-            conversationId,
-            from: socket.authUsername
-          });
-        }
-      });
-    } catch (err) {}
-  });
-
-  socket.on('dm stop typing', ({ conversationId, token }) => {
-    if (!token) return;
-    try {
-      jwt.verify(token, JWT_SECRET);
-      if (!socket.authUsername) return;
-      Conversation.findById(conversationId).then(conv => {
-        if (!conv) return;
-        const other = conv.participants.find(p => p !== socket.authUsername);
-        if (other) {
-          io.to(`user:${other}`).emit('dm stop typing', { conversationId });
-        }
-      });
-    } catch (err) {}
-  });
-
+  // ============ CHAT MESSAGE (ROOM) ============
   socket.on('chat message', async ({ room, message, username, replyToId }) => {
     try {
       const senderColor = socket.nameColor || getGuestColor(username);
@@ -885,6 +1130,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ============ TOGGLE REACTION ============
   socket.on('toggle reaction', async ({ messageId, emoji, username, room }) => {
     try {
       const message = await Message.findById(messageId);
@@ -921,6 +1167,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ============ COLOR CHANGED ============
   socket.on('color changed', ({ nameColor }) => {
     if (!socket.username || !socket.room || socket.isGuest) return;
     if (!isValidHexColor(nameColor)) return;
@@ -942,8 +1189,150 @@ io.on('connection', (socket) => {
     io.to(socket.room).emit('update user list', roomUsers[socket.room]);
   });
 
-  socket.on('disconnect', () => {
-    console.log('Un usuario se ha desconectado');
+  // ============ TYPING (ROOM) ============
+  socket.on('typing', ({ room, username }) => {
+    socket.broadcast.to(room).emit('user typing', username);
+  });
+
+  socket.on('stop typing', ({ room }) => {
+    socket.broadcast.to(room).emit('user stopped typing');
+  });
+
+  // ============ DM SEND ============
+  socket.on('dm send', async ({ conversationId, text, replyToId, token }) => {
+    try {
+      if (!token) {
+        console.log('[dm send] sin token');
+        return;
+      }
+      const payload = jwt.verify(token, JWT_SECRET);
+      const sender = await User.findById(payload.userId);
+      if (!sender) {
+        console.log('[dm send] sender no encontrado');
+        return;
+      }
+      console.log(`[dm send] de ${sender.username}, texto: "${(text||'').slice(0,30)}"`);
+
+      const conversation = await Conversation.findById(conversationId);
+      if (!conversation) {
+        console.log('[dm send] conversation no encontrada');
+        return;
+      }
+      if (!conversation.participants.includes(sender.username)) {
+        console.log('[dm send] sender no es participante');
+        return;
+      }
+
+      const otherUser = conversation.participants.find(p => p !== sender.username);
+
+      let replyToSnapshot = null;
+      let replyToRef = null;
+      if (replyToId) {
+        try {
+          const original = await DirectMessage.findById(replyToId);
+          if (original && original.conversationId.toString() === conversationId) {
+            replyToRef = original._id;
+            replyToSnapshot = {
+              username: original.from,
+              nameColor: original.fromColor || '#999999',
+              text: (original.text || '').slice(0, 200)
+            };
+          }
+        } catch (err) {
+          // ignoramos
+        }
+      }
+
+      const dm = new DirectMessage({
+        conversationId: conversation._id,
+        from: sender.username,
+        fromColor: sender.nameColor,
+        text,
+        replyTo: replyToRef,
+        replyToSnapshot
+      });
+      await dm.save();
+
+      conversation.lastMessageAt = dm.createdAt;
+      conversation.lastMessagePreview = (text || '').slice(0, 80);
+      conversation.lastMessageFrom = sender.username;
+      if (!conversation.unreadCount) conversation.unreadCount = new Map();
+      const currentUnread = conversation.unreadCount.get(otherUser) || 0;
+      conversation.unreadCount.set(otherUser, currentUnread + 1);
+      await conversation.save();
+
+      const payloadOut = {
+        _id: dm._id.toString(),
+        conversationId: conversation._id.toString(),
+        from: dm.from,
+        fromColor: dm.fromColor,
+        text: dm.text,
+        createdAt: dm.createdAt,
+        reactions: {},
+        replyTo: dm.replyTo ? dm.replyTo.toString() : null,
+        replyToSnapshot: dm.replyToSnapshot || null,
+        conversationMeta: {
+          lastMessageAt: conversation.lastMessageAt,
+          lastMessagePreview: conversation.lastMessagePreview,
+          lastMessageFrom: conversation.lastMessageFrom
+        }
+      };
+
+      const sendersInRoom = await io.in(`user:${sender.username}`).fetchSockets();
+      const othersInRoom = await io.in(`user:${otherUser}`).fetchSockets();
+      console.log(`[dm send] sender ${sender.username} sockets: ${sendersInRoom.length}, other ${otherUser} sockets: ${othersInRoom.length}`);
+
+      io.to(`user:${sender.username}`).emit('dm message', payloadOut);
+      io.to(`user:${otherUser}`).emit('dm message', payloadOut);
+    } catch (err) {
+      console.error('Error en dm send:', err);
+    }
+  });
+
+  // ============ DM TYPING ============
+  socket.on('dm typing', async ({ conversationId, token }) => {
+    if (!token) return;
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const user = await User.findById(payload.userId);
+      if (!user) return;
+
+      const conv = await Conversation.findById(conversationId);
+      if (!conv || !conv.participants.includes(user.username)) return;
+
+      const other = conv.participants.find(p => p !== user.username);
+      if (other) {
+        io.to(`user:${other}`).emit('dm typing', {
+          conversationId,
+          from: user.username
+        });
+      }
+    } catch (err) {
+      console.error('Error en dm typing:', err);
+    }
+  });
+
+  socket.on('dm stop typing', async ({ conversationId, token }) => {
+    if (!token) return;
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const user = await User.findById(payload.userId);
+      if (!user) return;
+
+      const conv = await Conversation.findById(conversationId);
+      if (!conv || !conv.participants.includes(user.username)) return;
+
+      const other = conv.participants.find(p => p !== user.username);
+      if (other) {
+        io.to(`user:${other}`).emit('dm stop typing', { conversationId });
+      }
+    } catch (err) {
+      console.error('Error en dm stop typing:', err);
+    }
+  });
+
+socket.on('disconnect', () => {
+    console.log('Un usuario se ha desconectado, socket:', socket.id);
     const { username, room } = socket;
     if (username && room && roomUsers[room]) {
       roomUsers[room] = roomUsers[room].filter(u => u.username !== username);
@@ -955,14 +1344,6 @@ io.on('connection', (socket) => {
       };
       io.to(room).emit('chat message', leaveMessage);
     }
-  });
-
-  socket.on('typing', ({ room, username }) => {
-    socket.broadcast.to(room).emit('user typing', username);
-  });
-
-  socket.on('stop typing', ({ room }) => {
-    socket.broadcast.to(room).emit('user stopped typing');
   });
 });
 
