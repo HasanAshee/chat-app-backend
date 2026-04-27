@@ -41,7 +41,10 @@ const Message = mongoose.model('Message', new mongoose.Schema({
       text: String
     }, { _id: false }),
     default: null
-  }
+  },
+  deletedForEveryone: { type: Boolean, default: false },
+  deletedAt: { type: Date, default: null },
+  deletedFor: { type: [String], default: [] }
 }));
 
 const User = mongoose.model('User', new mongoose.Schema({
@@ -92,7 +95,10 @@ const DirectMessage = mongoose.model('DirectMessage', new mongoose.Schema({
       text: String
     }, { _id: false }),
     default: null
-  }
+  },
+  deletedForEveryone: { type: Boolean, default: false },
+  deletedAt: { type: Date, default: null },
+  deletedFor: { type: [String], default: [] }
 }));
 
 const COLOR_PALETTE = ['#d946ef', '#4ade80', '#f97316', '#3b82f6', '#ec4899', '#14b8a6'];
@@ -129,6 +135,14 @@ const app = express();
 const server = http.createServer(app);
 
 const roomUsers = {};
+
+const DELETE_FOR_EVERYONE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function isWithinDeleteWindow(createdAt) {
+  if (!createdAt) return false;
+  const ageMs = Date.now() - new Date(createdAt).getTime();
+  return ageMs <= DELETE_FOR_EVERYONE_WINDOW_MS;
+}
 
 app.use(cors({
   origin: ["http://localhost:4200", "https://chap-appdemo.netlify.app"]
@@ -826,19 +840,24 @@ app.get('/dms/:id/messages', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'No tenés acceso a esta conversación' });
     }
 
-    const messages = await DirectMessage.find({ conversationId: conversation._id })
+    const allMessages = await DirectMessage.find({ conversationId: conversation._id })
       .sort({ createdAt: -1 })
       .limit(50);
 
-    const result = messages.reverse().map(m => ({
+    const visibleMessages = allMessages.filter(m =>
+      !m.deletedFor || !m.deletedFor.includes(req.username)
+    );
+
+    const result = visibleMessages.reverse().map(m => ({
       _id: m._id.toString(),
       from: m.from,
       fromColor: m.fromColor,
-      text: m.text,
+      text: m.deletedForEveryone ? '' : m.text,
       createdAt: m.createdAt,
-      reactions: m.reactions ? Object.fromEntries(m.reactions) : {},
+      reactions: m.deletedForEveryone ? {} : (m.reactions ? Object.fromEntries(m.reactions) : {}),
       replyTo: m.replyTo ? m.replyTo.toString() : null,
-      replyToSnapshot: m.replyToSnapshot || null
+      replyToSnapshot: m.replyToSnapshot || null,
+      deletedForEveryone: !!m.deletedForEveryone
     }));
 
     res.json(result);
@@ -928,7 +947,8 @@ app.get('/messages/search', async (req, res) => {
     const results = await Message.find({
       room,
       type: 'message',
-      text: regex
+      text: regex,
+      deletedForEveryone: { $ne: true }
     })
       .sort({ createdAt: -1 })
       .limit(30)
@@ -1089,18 +1109,22 @@ io.on('connection', (socket) => {
       });
 
       try {
-        const messages = await Message.find({ room: trimmedRoom }).sort({ createdAt: -1 }).limit(50);
-        const messagesWithReactions = messages.reverse().map(msg => ({
+        const allMessages = await Message.find({ room: trimmedRoom }).sort({ createdAt: -1 }).limit(50);
+        const visibleMessages = allMessages.filter(msg =>
+          !msg.deletedFor || !msg.deletedFor.includes(resolvedUsername)
+        );
+        const messagesWithReactions = visibleMessages.reverse().map(msg => ({
           _id: msg._id,
-          text: msg.text,
+          text: msg.deletedForEveryone ? '' : msg.text,
           username: msg.username,
           nameColor: msg.nameColor,
           type: msg.type,
           room: msg.room,
           createdAt: msg.createdAt,
-          reactions: msg.reactions ? Object.fromEntries(msg.reactions) : {},
+          reactions: msg.deletedForEveryone ? {} : (msg.reactions ? Object.fromEntries(msg.reactions) : {}),
           replyTo: msg.replyTo ? msg.replyTo.toString() : null,
-          replyToSnapshot: msg.replyToSnapshot || null
+          replyToSnapshot: msg.replyToSnapshot || null,
+          deletedForEveryone: !!msg.deletedForEveryone
         }));
         socket.emit('history', messagesWithReactions);
       } catch (err) {
@@ -1169,6 +1193,85 @@ io.on('connection', (socket) => {
       });
     } catch (err) {
       console.error('Error al guardar el mensaje:', err);
+    }
+  });
+
+  socket.on('delete message', async ({ messageId, mode, room, token }) => {
+    
+    try {
+      const message = await Message.findById(messageId);
+      if (!message) return;
+      if (message.type !== 'message') return;
+      if (message.room !== room) return;
+
+      let actorUsername = null;
+      let isAuthenticated = false;
+
+      if (token) {
+        try {
+          const payload = jwt.verify(token, JWT_SECRET);
+          const user = await User.findById(payload.userId);
+          if (user) {
+            actorUsername = user.username;
+            isAuthenticated = true;
+          }
+        } catch (err) {
+        }
+      }
+
+      if (!actorUsername) {
+        actorUsername = socket.username;
+      }
+
+      if (!actorUsername) return;
+
+      if (mode === 'me') {
+        if (!message.deletedFor.includes(actorUsername)) {
+          message.deletedFor.push(actorUsername);
+          await message.save();
+        }
+        socket.emit('message deleted for me', {
+          messageId: message._id.toString(),
+          room
+        });
+        return;
+      }
+
+      if (mode === 'everyone') {
+        const isOwn = message.username === actorUsername;
+        let isRoomOwner = false;
+        if (isAuthenticated) {
+          const roomDoc = await Room.findOne({ name: room });
+          if (roomDoc && roomDoc.ownerUsername === actorUsername) {
+            isRoomOwner = true;
+          }
+        }
+
+        if (!isOwn && !isRoomOwner) {
+          socket.emit('delete error', { message: 'No tenés permiso para borrar este mensaje' });
+          return;
+        }
+
+        if (isOwn && !isRoomOwner && !isWithinDeleteWindow(message.createdAt)) {
+          socket.emit('delete error', { message: 'Solo podés borrar tus mensajes dentro de las 24h' });
+          return;
+        }
+
+        message.deletedForEveryone = true;
+        message.deletedAt = new Date();
+        message.text = '';
+        message.reactions = new Map();
+        await message.save();
+
+        io.to(room).emit('message deleted for everyone', {
+          messageId: message._id.toString(),
+          room,
+          deletedBy: actorUsername,
+          wasOwn: isOwn
+        });
+      }
+    } catch (err) {
+      console.error('Error en delete message:', err);
     }
   });
 
@@ -1281,7 +1384,7 @@ io.on('connection', (socket) => {
             };
           }
         } catch (err) {
-          // ignoramos
+          
         }
       }
 
@@ -1328,6 +1431,69 @@ io.on('connection', (socket) => {
       io.to(`user:${otherUser}`).emit('dm message', payloadOut);
     } catch (err) {
       console.error('Error en dm send:', err);
+    }
+  });
+
+  socket.on('dm delete', async ({ messageId, conversationId, mode, token }) => {
+    try {
+      if (!token) return;
+
+      const payload = jwt.verify(token, JWT_SECRET);
+      const actor = await User.findById(payload.userId);
+      if (!actor) return;
+
+      const message = await DirectMessage.findById(messageId);
+      if (!message) return;
+      if (message.conversationId.toString() !== conversationId) return;
+
+      const conversation = await Conversation.findById(conversationId);
+      if (!conversation) return;
+      if (!conversation.participants.includes(actor.username)) return;
+
+      if (mode === 'me') {
+        if (!message.deletedFor.includes(actor.username)) {
+          message.deletedFor.push(actor.username);
+          await message.save();
+        }
+        io.to(`user:${actor.username}`).emit('dm deleted for me', {
+          messageId: message._id.toString(),
+          conversationId
+        });
+        return;
+      }
+
+      if (mode === 'everyone') {
+        if (message.from !== actor.username) {
+          socket.emit('delete error', { message: 'Solo podés borrar tus propios DMs para todos' });
+          return;
+        }
+        if (!isWithinDeleteWindow(message.createdAt)) {
+          socket.emit('delete error', { message: 'Solo podés borrar DMs dentro de las 24h' });
+          return;
+        }
+
+        message.deletedForEveryone = true;
+        message.deletedAt = new Date();
+        message.text = '';
+        message.reactions = new Map();
+        await message.save();
+
+        const other = conversation.participants.find(p => p !== actor.username);
+        io.to(`user:${actor.username}`).emit('dm deleted for everyone', {
+          messageId: message._id.toString(),
+          conversationId,
+          deletedBy: actor.username
+        });
+        if (other) {
+          io.to(`user:${other}`).emit('dm deleted for everyone', {
+            messageId: message._id.toString(),
+            conversationId,
+            deletedBy: actor.username
+          });
+        }
+      }
+    } catch (err) {
+      console.error('Error en dm delete:', err);
     }
   });
 
